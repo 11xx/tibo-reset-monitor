@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch Tibo for Codex usage-limit reset posts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tibo-codex-reset-monitor
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+StateDirectory=tibo-codex-reset-monitor
+StateDirectoryMode=0700
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

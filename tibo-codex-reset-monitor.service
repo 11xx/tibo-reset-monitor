@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch Tibo for Codex usage-limit reset posts
+Description=Watch Codex Resets for Tibo usage-limit signals
 After=network-online.target
 Wants=network-online.target
 

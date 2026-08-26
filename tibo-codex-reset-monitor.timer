@@ -1,10 +1,10 @@
 [Unit]
-Description=Poll Tibo's feed every five minutes
+Description=Check Codex Resets for Tibo usage-limit signals every 30 minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-RandomizedDelaySec=20s
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=60s
 Persistent=true
 
 [Install]

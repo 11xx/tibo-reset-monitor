@@ -37,7 +37,9 @@ SPEND_NOW_PERCENT = 75
 USE_SOME_PERCENT = 50
 # How long a cached status stays worth showing without a hedge.
 CACHE_FRESH_SECONDS = 15 * 60
-STAGE_RANK = {"wait": 0, "use-some": 1, "spend-now": 2, "landed": 3}
+# A reset that landed and a forecast worth spending now are both the top of the
+# ladder: neither escalates into the other, and the reset alert already speaks.
+STAGE_RANK = {"wait": 0, "use-some": 1, "spend-now": 2, "landed": 2}
 
 BASIS_LABEL = {
     "reset": "a reset was just announced",
@@ -55,11 +57,6 @@ POLICY_RE = re.compile(
 BUG_RE = re.compile(
     r"\b(?:bug|issue|incident|fix(?:ed|es)?|mitigat(?:e|ed|ion)|"
     r"inefficien(?:cy|cies)|drain(?:ed|ing)?)\b",
-    re.IGNORECASE,
-)
-COMPLETED_RE = re.compile(
-    r"(?:\b(?:have|has|just|now)\b.{0,80}\breset\b|"
-    r"\breset\b.{0,80}\b(?:complete|completed|done|propagated|landed|applied)\b)",
     re.IGNORECASE,
 )
 TEASER_RE = re.compile(
@@ -305,20 +302,18 @@ def classify_reset(reset: ResetSignal) -> str:
         return "LIMIT POLICY CHANGE"
     if BUG_RE.search(reset.text):
         return "BUG/FIX RESET"
-    if COMPLETED_RE.search(reset.text):
-        return "RESET PROPAGATED"
     if TEASER_RE.search(reset.text):
         return "FOLLOW-UP TEASED"
-    if reset.source.type == "x_post":
-        return "RESET ANNOUNCED"
-    return "SILENT RESET REPORT"
+    return "RESET DEPLOYED"
 
 
 def reset_action(reset: ResetSignal, event: str) -> str:
     if event == "BANKED RESET CREDITED":
         return "CHECK STATUS"
-    if event in {"RESET ANNOUNCED", "FOLLOW-UP TEASED"}:
+    if event == "FOLLOW-UP TEASED":
         return "SPEND NOW" if IMMINENT_RE.search(reset.text) else "USE SOME"
+    if event == "RESET DEPLOYED":
+        return "USE SOME"
     return "CHECK STATUS"
 
 
@@ -391,7 +386,7 @@ def forecast(snapshot: StatusSnapshot, now: datetime | None = None) -> Forecast:
     reset = snapshot.latest_reset
     announced = parse_timestamp(reset.announced_at) if reset else None
     if announced is not None and now - announced <= timedelta(hours=LANDED_RESET_HOURS):
-        return Forecast(100, "reset", "landed", "SPEND NOW")
+        return Forecast(100, "reset", "landed", "USE SOME")
 
     watch = snapshot.active_watch
     if watch is not None:

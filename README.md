@@ -23,7 +23,8 @@ forecast that has grown past the next actionable threshold.
 
 Every status resolves to one percentage, so the same number drives the
 notification and the bar. A reset announced within the last three hours is not a
-prediction and reads as certainty. Otherwise a published forecast carries the
+prediction and reads as certainty, advising `USE SOME` — the same thing its own
+notification says. Otherwise a published forecast carries the
 number — its own percentage, or the percentage its level stands for — unless it
 has expired or the reset it predicted has already been announced. With no
 forecast in force, the reading falls back to how far into the published average

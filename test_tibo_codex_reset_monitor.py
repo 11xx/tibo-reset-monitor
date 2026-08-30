@@ -19,6 +19,7 @@ from tibo_codex_reset_monitor import (
     format_local_time,
     format_watch_alert,
     parse_status,
+    reset_action,
     run,
     watch_signature,
 )
@@ -168,7 +169,29 @@ class MonitorTests(unittest.TestCase):
                     Source("observed"),
                 )
             ),
-            "SILENT RESET REPORT",
+            "RESET DEPLOYED",
+        )
+        landed = ResetSignal(
+            "5",
+            "regular",
+            "2026-08-27T16:35:05Z",
+            "Never slept better and feeling reseted. Brand new me and brand new "
+            "usage for all ChatGPT Work and Codex users.",
+            Source("x_post", "https://x.com/thsottiaux/status/5"),
+        )
+        self.assertEqual(classify_reset(landed), "RESET DEPLOYED")
+        self.assertEqual(reset_action(landed, "RESET DEPLOYED"), "USE SOME")
+        self.assertEqual(
+            classify_reset(
+                ResetSignal(
+                    "6",
+                    "regular",
+                    "2026-08-27T16:35:05Z",
+                    "Resetting usage limits now for all Codex users.",
+                    Source("x_post"),
+                )
+            ),
+            "RESET DEPLOYED",
         )
 
     def test_local_time_is_sao_paulo(self):
@@ -245,7 +268,8 @@ class MonitorTests(unittest.TestCase):
             ):
                 self.assertEqual(run(), 0)
                 summary, body = notify.call_args.args[:2]
-                self.assertIn("RESET PROPAGATED", summary)
+                self.assertIn("RESET DEPLOYED", summary)
+                self.assertIn("Action: USE SOME", body)
                 self.assertIn("Scope: Codex + ChatGPT Work", body)
                 self.assertIn("Affected plans: all paid plans (stated)", body)
                 self.assertIn("Time (São Paulo): 2026-08-26 09:00", body)
@@ -294,7 +318,7 @@ class MonitorTests(unittest.TestCase):
         )
         prediction = forecast(snapshot, NOW)
         self.assertEqual((prediction.probability, prediction.basis), (100, "reset"))
-        self.assertEqual(prediction.stage, "landed")
+        self.assertEqual((prediction.stage, prediction.action), ("landed", "USE SOME"))
 
     def test_forecast_drops_a_watch_its_own_reset_has_overtaken(self):
         watch = Watch(

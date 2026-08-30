@@ -1,10 +1,11 @@
 [Unit]
-Description=Check Codex Resets for Tibo usage-limit signals every 30 minutes
+Description=Check Codex Resets for Tibo usage-limit signals every 5 minutes
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=30min
-RandomizedDelaySec=60s
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=15s
 Persistent=true
 
 [Install]

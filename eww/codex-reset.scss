@@ -1,0 +1,18 @@
+.codex-reset {
+  padding: 0 4px;
+}
+
+/* The tracker's own favicon is a photograph, so it needs more damping than the
+   flat glyphs it sits beside to read as one row rather than as an intrusion. */
+.codex-reset__icon {
+  opacity: 0.7;
+}
+
+.codex-reset__percent {
+  opacity: 0.5;
+}
+
+/* A forecast the monitor could not refresh is still shown, just visibly older. */
+.codex-reset--stale {
+  opacity: 0.65;
+}

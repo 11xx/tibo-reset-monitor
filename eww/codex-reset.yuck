@@ -1,0 +1,39 @@
+;; An indicator for how likely a Codex usage reset is right now.
+;;
+;; The reading comes from the monitor's own cache, so a bar polling every few
+;; seconds asks the public tracker nothing: the user timer is the only thing
+;; that fetches, and this command just re-reads what it stored and re-derives
+;; the forecast against the current time.
+;;
+;; Nothing here names a colour, a path, or a monitor. Include the file, place
+;; `(codex-reset-indicator :icon "…/assets/codex-resets.jpg")` in a bar, and
+;; colour the classes below from the config's own palette. The shipped icon is
+;; the tracker's own favicon, so the indicator looks like the source it quotes.
+
+(defpoll codex-reset-json
+  :interval "30s"
+  :initial '{"state":"unavailable","visible":false,"probability":0,"basis":"unknown","stage":"wait","action":"WAIT","tooltip":""}'
+  "tibo-codex-reset-monitor --bar")
+
+;; Hidden below the actionable threshold. A percentage that sits on the bar all
+;; day is wallpaper, and the point of this one is that its appearance is itself
+;; the signal; the tooltip then carries the forecast, its wording, and its age.
+;;
+;; A stale cache still shows its number, marked with a tilde: an old forecast is
+;; worth more than a blank, as long as it cannot pass for a current one.
+(defwidget codex-reset-indicator [icon]
+  (box
+    :class "codex-reset codex-reset--${codex-reset-json.stage} codex-reset--${codex-reset-json.state}"
+    :visible {codex-reset-json.visible}
+    :tooltip {codex-reset-json.tooltip}
+    :space-evenly false
+    :spacing 3
+    (image
+      :class "codex-reset__icon"
+      :path icon
+      :image-width 14
+      :image-height 14)
+    (label
+      :class "codex-reset__chance"
+      :text "${codex-reset-json.state == "stale" ? "~" : ""}${codex-reset-json.probability}")
+    (label :class "codex-reset__percent" :text "%")))

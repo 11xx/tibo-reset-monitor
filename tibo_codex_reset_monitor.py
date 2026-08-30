@@ -14,15 +14,37 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 APP = "tibo-codex-reset-monitor"
 STATUS_URL = "https://codex-resets.com/api/v1/status"
 TRACKER_URL = "https://codex-resets.com/"
-USER_AGENT = f"{APP}/2.0"
+USER_AGENT = f"{APP}/3.0"
 MAX_RESPONSE_BYTES = 512 * 1024
+
+# A reset stays worth spending on for a few hours after it is announced, so the
+# forecast reports certainty rather than a prediction during that window.
+LANDED_RESET_HOURS = 3
+# A forecast published without a percentage still has a level; these are the
+# percentages the two levels stand for.
+LEVEL_CHANCE = {"strong": 75, "elevated": 45}
+# Cadence alone is weak evidence: a long gap since the last reset raises the
+# reading but never past this, which keeps it below the actionable threshold.
+CADENCE_CEILING = 45
+SPEND_NOW_PERCENT = 75
+USE_SOME_PERCENT = 50
+# How long a cached status stays worth showing without a hedge.
+CACHE_FRESH_SECONDS = 15 * 60
+STAGE_RANK = {"wait": 0, "use-some": 1, "spend-now": 2, "landed": 3}
+
+BASIS_LABEL = {
+    "reset": "a reset was just announced",
+    "watch": "published forecast",
+    "cadence": "reset cadence only, no live forecast",
+    "unknown": "no forecast and no cadence published",
+}
 
 SPACE_RE = re.compile(r"\s+")
 POLICY_RE = re.compile(
@@ -89,6 +111,17 @@ class StatusSnapshot:
     latest_reset: ResetSignal | None
     active_watch: Watch | None
     stats: dict[str, object]
+    # The `data` object the snapshot was parsed from, kept so a cached status
+    # can be restored through the same validation that accepted it.
+    raw: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class Forecast:
+    probability: int
+    basis: str
+    stage: str
+    action: str
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -184,6 +217,7 @@ def parse_status(payload: bytes) -> StatusSnapshot:
         latest_reset=None if latest_value is None else _parse_reset(latest_value),
         active_watch=None if watch_value is None else _parse_watch(watch_value),
         stats=_mapping(data["stats"], "data.stats"),
+        raw=data,
     )
 
 
@@ -210,17 +244,21 @@ def display_text(value: str, limit: int = 800) -> str:
     return SPACE_RE.sub(" ", value).strip()[:limit]
 
 
-def format_local_time(value: str | None) -> str:
+def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
-        return "unknown"
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        local = parsed.astimezone(LOCAL_ZONE)
     except ValueError:
-        return value
-    return f"{local:%Y-%m-%d %H:%M} (São Paulo)"
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def format_local_time(value: str | None) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return value or "unknown"
+    return f"{parsed.astimezone(LOCAL_ZONE):%Y-%m-%d %H:%M} (São Paulo)"
 
 
 def describe_scope(text: str) -> str:
@@ -318,6 +356,61 @@ def watch_action(watch: Watch) -> str:
     return "CHECK STATUS"
 
 
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def cadence_probability(stats: dict[str, object]) -> int | None:
+    """Read the published cadence as a percentage, capped below actionable."""
+    elapsed = _number(stats.get("days_since_last"))
+    average = _number(stats.get("avg_interval_days"))
+    if elapsed is None or average is None or average <= 0:
+        return None
+    return round(CADENCE_CEILING * min(1.0, max(0.0, elapsed) / average))
+
+
+def stage_for(probability: int) -> tuple[str, str]:
+    if probability >= SPEND_NOW_PERCENT:
+        return "spend-now", "SPEND NOW"
+    if probability >= USE_SOME_PERCENT:
+        return "use-some", "USE SOME"
+    return "wait", "WAIT"
+
+
+def forecast(snapshot: StatusSnapshot, now: datetime | None = None) -> Forecast:
+    """One percentage for how likely usable quota is in hand or on the way.
+
+    A reset announced within the last few hours is not a prediction, so it reads
+    as certainty. Otherwise a live published forecast wins, and cadence carries
+    the reading when no forecast applies. A forecast is not live once it has
+    expired, nor once the reset it predicted has been announced.
+    """
+    now = now or datetime.now(timezone.utc)
+    reset = snapshot.latest_reset
+    announced = parse_timestamp(reset.announced_at) if reset else None
+    if announced is not None and now - announced <= timedelta(hours=LANDED_RESET_HOURS):
+        return Forecast(100, "reset", "landed", "SPEND NOW")
+
+    watch = snapshot.active_watch
+    if watch is not None:
+        observed = parse_timestamp(watch.observed_at)
+        expires = parse_timestamp(watch.expires_at)
+        superseded = announced is not None and observed is not None and announced > observed
+        expired = expires is not None and expires <= now
+        if not superseded and not expired:
+            chance = watch.reset_chance_percent
+            if chance is None:
+                chance = LEVEL_CHANCE[watch.level]
+            return Forecast(chance, "watch", *stage_for(chance))
+
+    baseline = cadence_probability(snapshot.stats)
+    if baseline is None:
+        return Forecast(0, "unknown", "wait", "WAIT")
+    return Forecast(baseline, "cadence", *stage_for(baseline))
+
+
 def watch_signature(watch: Watch | None) -> str | None:
     if watch is None:
         return None
@@ -344,7 +437,7 @@ def format_stats(stats: dict[str, object]) -> str:
         values.append(f"{total} tracked")
     days = stats.get("days_since_last")
     if isinstance(days, (int, float)) and not isinstance(days, bool):
-        values.append(f"{days:g} days since last")
+        values.append(f"{days:g} day{'' if days == 1 else 's'} since last")
     average = stats.get("avg_interval_days")
     if isinstance(average, (int, float)) and not isinstance(average, bool):
         values.append(f"{average:g}-day average")
@@ -417,7 +510,13 @@ def format_watch_cleared() -> tuple[str, str, str]:
 
 
 def format_status_report(snapshot: StatusSnapshot) -> str:
-    lines = ["Codex Resets status", f"Tracker: {TRACKER_URL} (unofficial)"]
+    prediction = forecast(snapshot)
+    lines = [
+        "Codex Resets status",
+        f"Tracker: {TRACKER_URL} (unofficial)",
+        f"Forecast: {prediction.probability}% [{prediction.action}]"
+        f" from {BASIS_LABEL[prediction.basis]}",
+    ]
     if snapshot.latest_reset is None:
         lines.append("Latest reset: none")
     else:
@@ -429,6 +528,95 @@ def format_status_report(snapshot: StatusSnapshot) -> str:
         event, action, body = format_watch_alert(snapshot.active_watch, snapshot.stats)
         lines.extend([f"Active watch: {event} [{action}]", body])
     return "\n".join(lines)
+
+
+def format_age(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    return f"{minutes // 60}h {minutes % 60:02d}m ago"
+
+
+def bar_tooltip(
+    snapshot: StatusSnapshot, prediction: Forecast, cache_state: str, age_seconds: float
+) -> str:
+    lines = [
+        f"Codex reset chance {prediction.probability}% — {BASIS_LABEL[prediction.basis]}",
+        f"Action: {prediction.action}",
+    ]
+    watch = snapshot.active_watch
+    if watch is not None:
+        chance = (
+            f"{watch.reset_chance_percent}%"
+            if watch.reset_chance_percent is not None
+            else "unpublished"
+        )
+        lines.extend(
+            [
+                f"Forecast: {watch.level}; chance {chance}; window {watch.forecast_window}",
+                f"Forecast expires: {format_local_time(watch.expires_at)}",
+                f"Said: {display_text(watch.text, 240)}",
+            ]
+        )
+    reset = snapshot.latest_reset
+    if reset is not None:
+        lines.extend(
+            [
+                f"Last reset: {classify_reset(reset)} · {format_local_time(reset.announced_at)}",
+                f"Scope: {describe_scope(reset.text)} · plans: {describe_plans(reset.text)}",
+            ]
+        )
+    lines.extend(
+        [
+            f"History: {format_stats(snapshot.stats)}",
+            f"Checked {format_age(age_seconds)}"
+            + (" — tracker unreachable since" if cache_state == "stale" else ""),
+            f"{TRACKER_URL} (unofficial; verify in Codex)",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def cached_snapshot(state: dict[str, object]) -> StatusSnapshot | None:
+    data = state.get("snapshot")
+    if not isinstance(data, dict):
+        return None
+    try:
+        return parse_status(json.dumps({"data": data}).encode())
+    except ValueError:
+        return None
+
+
+def bar_payload(state: dict[str, object], now: datetime | None = None) -> dict[str, object]:
+    """Render the cached status as the one line the bar indicator reads."""
+    now = now or datetime.now(timezone.utc)
+    snapshot = cached_snapshot(state)
+    raw_fetched = state.get("fetched_at")
+    fetched = parse_timestamp(raw_fetched) if isinstance(raw_fetched, str) else None
+    if snapshot is None or fetched is None:
+        return {
+            "state": "unavailable",
+            "visible": False,
+            "probability": 0,
+            "basis": "unknown",
+            "stage": "wait",
+            "action": "WAIT",
+            "tooltip": f"Codex reset monitor has no status yet.\n{TRACKER_URL} (unofficial)",
+        }
+    age_seconds = max(0.0, (now - fetched).total_seconds())
+    cache_state = "fresh" if age_seconds < CACHE_FRESH_SECONDS else "stale"
+    prediction = forecast(snapshot, now)
+    return {
+        "state": cache_state,
+        "visible": prediction.stage != "wait",
+        "probability": prediction.probability,
+        "basis": prediction.basis,
+        "stage": prediction.stage,
+        "action": prediction.action,
+        "tooltip": bar_tooltip(snapshot, prediction, cache_state, age_seconds),
+    }
 
 
 def state_path() -> Path:
@@ -485,8 +673,10 @@ def run(show_latest: bool = False) -> int:
         return record_failure(state, error)
 
     if snapshot is None:
+        # The cached status is still the current one, so its age restarts too.
         state["failures"] = 0
         state["last_checked_at"] = now_utc()
+        state["fetched_at"] = now_utc()
         save_state(state)
         print("status unchanged (304)")
         return 0
@@ -497,18 +687,21 @@ def run(show_latest: bool = False) -> int:
 
     current_reset_id = snapshot.latest_reset.id if snapshot.latest_reset else None
     current_watch_signature = watch_signature(snapshot.active_watch)
+    prediction = forecast(snapshot)
+    settled = {
+        "api_initialized": True,
+        "failures": 0,
+        "last_checked_at": now_utc(),
+        "fetched_at": now_utc(),
+        "snapshot": snapshot.raw,
+        "last_reset_id": current_reset_id,
+        "watch_signature": current_watch_signature,
+        "stage": prediction.stage,
+    }
     if not state.get("api_initialized"):
         state.pop("initialized", None)
         state.pop("seen", None)
-        state.update(
-            {
-                "api_initialized": True,
-                "failures": 0,
-                "last_checked_at": now_utc(),
-                "last_reset_id": current_reset_id,
-                "watch_signature": current_watch_signature,
-            }
-        )
+        state.update(settled)
         if response_etag:
             state["etag"] = response_etag
         save_state(state)
@@ -525,6 +718,13 @@ def run(show_latest: bool = False) -> int:
         else:
             alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
 
+    # A forecast that grows within its band changes no signature, so the stage
+    # carries the escalation on its own — unless an alert above already says it.
+    previous_stage = state.get("stage")
+    escalated = STAGE_RANK.get(prediction.stage, 0) > STAGE_RANK.get(previous_stage, 0)
+    if escalated and not alerts and snapshot.active_watch is not None:
+        alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
+
     if alerts:
         labels = ", ".join(alert[0] for alert in alerts)
         body = "\n\n".join(alert[2] for alert in alerts)
@@ -532,15 +732,7 @@ def run(show_latest: bool = False) -> int:
         notify(f"Codex reset monitor: {labels}", body[:4000], critical=critical)
         print(f"notified: {labels}")
 
-    state.update(
-        {
-            "api_initialized": True,
-            "failures": 0,
-            "last_checked_at": now_utc(),
-            "last_reset_id": current_reset_id,
-            "watch_signature": current_watch_signature,
-        }
-    )
+    state.update(settled)
     if response_etag:
         state["etag"] = response_etag
     save_state(state)
@@ -569,9 +761,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--show-latest", action="store_true")
     parser.add_argument("--test-notification", action="store_true")
+    parser.add_argument(
+        "--bar",
+        action="store_true",
+        help="print the cached status as one JSON line for a bar indicator",
+    )
     args = parser.parse_args()
     if args.test_notification:
         notify("Codex reset monitor", "Notifications are working.", critical=True)
+        return 0
+    if args.bar:
+        # Reads the cache the timer writes: a bar polls far more often than the
+        # tracker should be asked anything.
+        print(json.dumps(bar_payload(load_state()), separators=(",", ":")))
         return 0
     return run(args.show_latest)
 

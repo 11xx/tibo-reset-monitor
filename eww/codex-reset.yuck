@@ -6,7 +6,7 @@
 ;; the forecast against the current time.
 ;;
 ;; Nothing here names a colour, a path, or a monitor. Include the file, place
-;; `(codex-reset-indicator :icon "…/assets/codex-resets.jpg")` in a bar, and
+;; `(codex-reset-indicator :icon "…/assets/codex-resets.png")` in a bar, and
 ;; colour the classes below from the config's own palette. The shipped icon is
 ;; the tracker's own favicon, so the indicator looks like the source it quotes.
 

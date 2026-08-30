@@ -49,7 +49,7 @@ palette. Include it and place the widget in a bar:
 
 ```lisp
 (include ".../eww/codex-reset.yuck")
-(codex-reset-indicator :icon ".../eww/assets/codex-resets.jpg")
+(codex-reset-indicator :icon ".../eww/assets/codex-resets.png")
 ```
 
 ## Install

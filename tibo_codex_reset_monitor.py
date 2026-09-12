@@ -27,6 +27,15 @@ MAX_RESPONSE_BYTES = 512 * 1024
 # A reset stays worth spending on for a few hours after it is announced, so the
 # forecast reports certainty rather than a prediction during that window.
 LANDED_RESET_HOURS = 3
+# The tracker publishes a scheduled reset without a probability, so the monitor
+# supplies its own reading: an explicit announcement outranks cadence, and it
+# crosses into SPEND NOW as the landing time arrives.
+SCHEDULE_AHEAD_PERCENT = 65
+SCHEDULE_IMMINENT_PERCENT = 80
+SCHEDULE_IMMINENT_MINUTES = 60
+# A schedule whose landing time has passed is awaiting evidence, not a dead
+# letter: the tracker keeps it until it observes the reset.
+SCHEDULE_DUE_PERCENT = 85
 # A forecast published without a percentage still has a level; these are the
 # percentages the two levels stand for.
 LEVEL_CHANCE = {"strong": 75, "elevated": 45}
@@ -43,6 +52,8 @@ STAGE_RANK = {"wait": 0, "use-some": 1, "spend-now": 2, "landed": 2}
 
 BASIS_LABEL = {
     "reset": "a reset was just announced",
+    "scheduled": "a reset is scheduled to land",
+    "scheduled-due": "a scheduled reset is due, awaiting confirmation",
     "watch": "published forecast",
     "cadence": "reset cadence only, no live forecast",
     "unknown": "no forecast and no cadence published",
@@ -93,6 +104,17 @@ class ResetSignal:
 
 
 @dataclass(frozen=True)
+class ScheduledReset:
+    id: str
+    status: str
+    reset_type: str
+    announced_at: str
+    scheduled_for: str | None
+    text: str
+    source: Source
+
+
+@dataclass(frozen=True)
 class Watch:
     level: str
     reset_chance_percent: int | None
@@ -106,6 +128,7 @@ class Watch:
 @dataclass(frozen=True)
 class StatusSnapshot:
     latest_reset: ResetSignal | None
+    scheduled_reset: ScheduledReset | None
     active_watch: Watch | None
     stats: dict[str, object]
     # The `data` object the snapshot was parsed from, kept so a cached status
@@ -171,6 +194,26 @@ def _parse_reset(value: object) -> ResetSignal:
     )
 
 
+def _parse_scheduled_reset(value: object) -> ScheduledReset:
+    raw = _mapping(value, "data.scheduled_reset")
+    reset_type = raw.get("reset_type")
+    if reset_type not in {"regular", "banked"}:
+        raise ValueError("data.scheduled_reset.reset_type is not supported")
+    return ScheduledReset(
+        id=_required_string(raw.get("id"), "data.scheduled_reset.id"),
+        status=_required_string(raw.get("status"), "data.scheduled_reset.status"),
+        reset_type=reset_type,
+        announced_at=_required_string(
+            raw.get("announced_at"), "data.scheduled_reset.announced_at"
+        ),
+        scheduled_for=_optional_string(
+            raw.get("scheduled_for"), "data.scheduled_reset.scheduled_for"
+        ),
+        text=_content_string(raw.get("text"), "data.scheduled_reset.text"),
+        source=_parse_source(raw.get("source"), "data.scheduled_reset.source"),
+    )
+
+
 def _parse_watch(value: object) -> Watch:
     raw = _mapping(value, "data.active_watch")
     level = raw.get("level")
@@ -209,9 +252,15 @@ def parse_status(payload: bytes) -> StatusSnapshot:
         if field not in data:
             raise ValueError(f"data.{field} is missing")
     latest_value = data["latest_reset"]
+    # `scheduled_reset` is required by the current API spec but absent from
+    # responses written before it existed, so an absent field is not news here.
+    scheduled_value = data.get("scheduled_reset")
     watch_value = data["active_watch"]
     return StatusSnapshot(
         latest_reset=None if latest_value is None else _parse_reset(latest_value),
+        scheduled_reset=None
+        if scheduled_value is None
+        else _parse_scheduled_reset(scheduled_value),
         active_watch=None if watch_value is None else _parse_watch(watch_value),
         stats=_mapping(data["stats"], "data.stats"),
         raw=data,
@@ -241,6 +290,10 @@ def display_text(value: str, limit: int = 800) -> str:
     return SPACE_RE.sub(" ", value).strip()[:limit]
 
 
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -256,6 +309,17 @@ def format_local_time(value: str | None) -> str:
     if parsed is None:
         return value or "unknown"
     return f"{parsed.astimezone(LOCAL_ZONE):%Y-%m-%d %H:%M} (São Paulo)"
+
+
+def format_countdown(value: str | None, now: datetime | None = None) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return "unknown"
+    now = now or utcnow()
+    minutes = int(abs((parsed - now).total_seconds()) // 60)
+    hours, minutes = divmod(minutes, 60)
+    span = f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+    return f"in {span}" if parsed >= now else f"overdue by {span}"
 
 
 def describe_scope(text: str) -> str:
@@ -286,9 +350,9 @@ def describe_plans(text: str) -> str:
     return "; ".join(plans) if plans else "unknown"
 
 
-def describe_reset_quota(reset: ResetSignal) -> str:
-    lower = reset.text.lower()
-    if reset.reset_type == "banked":
+def describe_reset_quota(reset_type: str, text: str) -> str:
+    lower = text.lower()
+    if reset_type == "banked":
         return "banked reset"
     if re.search(r"\bpurchased\b|\bpaid credits?\b|\bcredit balance\b", lower):
         return "purchased credits (stated)"
@@ -374,25 +438,62 @@ def stage_for(probability: int) -> tuple[str, str]:
     return "wait", "WAIT"
 
 
+def schedule_reading(schedule: ScheduledReset, now: datetime) -> Forecast:
+    """The monitor's own reading of a scheduled reset awaiting evidence.
+
+    The API attaches no probability to a schedule, so the number is the
+    monitor's: an explicit announcement outranks cadence, and it crosses into
+    SPEND NOW as the landing time arrives. A schedule whose landing time has
+    passed stays actionable, because the tracker keeps it until it observes
+    the reset rather than treating the deadline as completion.
+    """
+    due = parse_timestamp(schedule.scheduled_for)
+    if due is not None and due <= now:
+        probability = SCHEDULE_DUE_PERCENT
+        basis = "scheduled-due"
+    else:
+        imminent = due is not None and due - now <= timedelta(
+            minutes=SCHEDULE_IMMINENT_MINUTES
+        )
+        probability = SCHEDULE_IMMINENT_PERCENT if imminent else SCHEDULE_AHEAD_PERCENT
+        basis = "scheduled"
+    stage, action = stage_for(probability)
+    return Forecast(probability, basis, stage, action)
+
+
 def forecast(snapshot: StatusSnapshot, now: datetime | None = None) -> Forecast:
     """One percentage for how likely usable quota is in hand or on the way.
 
     A reset announced within the last few hours is not a prediction, so it reads
-    as certainty. Otherwise a live published forecast wins, and cadence carries
-    the reading when no forecast applies. A forecast is not live once it has
-    expired, nor once the reset it predicted has been announced.
+    as certainty. A scheduled reset the tracker is still awaiting evidence for
+    comes next, because an explicit announcement outranks a probabilistic watch
+    and cadence alike. Otherwise a live published forecast wins, and cadence
+    carries the reading when no forecast applies. A forecast is not live once
+    it has expired, nor once a reset announced after it has superseded it.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     reset = snapshot.latest_reset
     announced = parse_timestamp(reset.announced_at) if reset else None
     if announced is not None and now - announced <= timedelta(hours=LANDED_RESET_HOURS):
         return Forecast(100, "reset", "landed", "USE SOME")
 
+    schedule = snapshot.scheduled_reset
+    schedule_announced = parse_timestamp(schedule.announced_at) if schedule else None
+    schedule_superseded = (
+        announced is not None
+        and schedule_announced is not None
+        and announced > schedule_announced
+    )
+    if schedule is not None and not schedule_superseded:
+        return schedule_reading(schedule, now)
+
     watch = snapshot.active_watch
     if watch is not None:
         observed = parse_timestamp(watch.observed_at)
         expires = parse_timestamp(watch.expires_at)
-        superseded = announced is not None and observed is not None and announced > observed
+        superseded = (
+            announced is not None and observed is not None and announced > observed
+        )
         expired = expires is not None and expires <= now
         if not superseded and not expired:
             chance = watch.reset_chance_percent
@@ -415,6 +516,21 @@ def watch_signature(watch: Watch | None) -> str | None:
         "forecast_window": watch.forecast_window,
         "text": display_text(watch.text),
         "source": {"type": watch.source.type, "url": watch.source.url},
+    }
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def schedule_signature(schedule: ScheduledReset | None) -> str | None:
+    if schedule is None:
+        return None
+    stable = {
+        "id": schedule.id,
+        "status": schedule.status,
+        "reset_type": schedule.reset_type,
+        "announced_at": schedule.announced_at,
+        "scheduled_for": schedule.scheduled_for,
     }
     return hashlib.sha256(
         json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
@@ -449,7 +565,7 @@ def format_reset_alert(reset: ResetSignal, stats: dict[str, object]) -> tuple[st
             f"Time (São Paulo): {format_local_time(reset.announced_at)}",
             f"Scope: {describe_scope(reset.text)}",
             f"Affected plans: {describe_plans(reset.text)}",
-            f"Quota: {describe_reset_quota(reset)}",
+            f"Quota: {describe_reset_quota(reset.reset_type, reset.text)}",
             f"Text: {display_text(reset.text)}",
             f"History: {format_stats(stats)}",
             f"Source post: {source_link(reset.source)}",
@@ -486,15 +602,39 @@ def format_watch_alert(watch: Watch, stats: dict[str, object]) -> tuple[str, str
     return event, action, body
 
 
-def format_watch_cleared() -> tuple[str, str, str]:
+def format_scheduled_alert(
+    schedule: ScheduledReset, stats: dict[str, object], now: datetime | None = None
+) -> tuple[str, str, str]:
+    now = now or utcnow()
+    reading = schedule_reading(schedule, now)
+    event = "RESET DUE" if reading.basis == "scheduled-due" else "RESET SCHEDULED"
+    body = "\n".join(
+        [
+            f"Event: {event}",
+            f"Action: {reading.action}",
+            f"Lands (São Paulo): {format_local_time(schedule.scheduled_for)}",
+            f"Countdown: {format_countdown(schedule.scheduled_for, now)}",
+            f"Scope: {describe_scope(schedule.text)}",
+            f"Affected plans: {describe_plans(schedule.text)}",
+            f"Quota: {describe_reset_quota(schedule.reset_type, schedule.text)}",
+            f"Text: {display_text(schedule.text)}",
+            f"History: {format_stats(stats)}",
+            f"Source post: {source_link(schedule.source)}",
+            f"Tracker: {TRACKER_URL} (unofficial; verify in Codex status)",
+        ]
+    )
+    return event, reading.action, body
+
+
+def format_forecast_cleared() -> tuple[str, str, str]:
     return (
-        "RESET WATCH CLEARED",
+        "RESET FORECAST CLEARED",
         "WAIT",
         "\n".join(
             [
-                "Event: RESET WATCH CLEARED",
+                "Event: RESET FORECAST CLEARED",
                 "Action: WAIT",
-                "Forecast: no active forecast is currently published",
+                "Forecast: no active forecast and no scheduled reset are published",
                 "Scope: unknown",
                 "Affected plans: unknown",
                 "Quota: unknown",
@@ -517,6 +657,13 @@ def format_status_report(snapshot: StatusSnapshot) -> str:
     else:
         event, action, body = format_reset_alert(snapshot.latest_reset, snapshot.stats)
         lines.extend([f"Latest reset: {event} [{action}]", body])
+    if snapshot.scheduled_reset is None:
+        lines.append("Scheduled reset: none")
+    else:
+        event, action, body = format_scheduled_alert(
+            snapshot.scheduled_reset, snapshot.stats
+        )
+        lines.extend([f"Scheduled reset: {event} [{action}]", body])
     if snapshot.active_watch is None:
         lines.append("Active watch: none")
     else:
@@ -535,12 +682,25 @@ def format_age(seconds: float) -> str:
 
 
 def bar_tooltip(
-    snapshot: StatusSnapshot, prediction: Forecast, cache_state: str, age_seconds: float
+    snapshot: StatusSnapshot,
+    prediction: Forecast,
+    cache_state: str,
+    age_seconds: float,
+    now: datetime,
 ) -> str:
     lines = [
         f"Codex reset chance {prediction.probability}% — {BASIS_LABEL[prediction.basis]}",
         f"Action: {prediction.action}",
     ]
+    schedule = snapshot.scheduled_reset
+    if schedule is not None:
+        lines.extend(
+            [
+                f"Scheduled reset: {format_local_time(schedule.scheduled_for)}"
+                f" ({format_countdown(schedule.scheduled_for, now)})",
+                f"Said: {display_text(schedule.text, 240)}",
+            ]
+        )
     watch = snapshot.active_watch
     if watch is not None:
         chance = (
@@ -586,7 +746,7 @@ def cached_snapshot(state: dict[str, object]) -> StatusSnapshot | None:
 
 def bar_payload(state: dict[str, object], now: datetime | None = None) -> dict[str, object]:
     """Render the cached status as the one line the bar indicator reads."""
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     snapshot = cached_snapshot(state)
     raw_fetched = state.get("fetched_at")
     fetched = parse_timestamp(raw_fetched) if isinstance(raw_fetched, str) else None
@@ -610,7 +770,7 @@ def bar_payload(state: dict[str, object], now: datetime | None = None) -> dict[s
         "basis": prediction.basis,
         "stage": prediction.stage,
         "action": prediction.action,
-        "tooltip": bar_tooltip(snapshot, prediction, cache_state, age_seconds),
+        "tooltip": bar_tooltip(snapshot, prediction, cache_state, age_seconds, now),
     }
 
 
@@ -638,7 +798,7 @@ def save_state(state: dict[str, object]) -> None:
 
 
 def now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utcnow().isoformat()
 
 
 def record_failure(state: dict[str, object], error: Exception) -> int:
@@ -658,6 +818,84 @@ def record_failure(state: dict[str, object], error: Exception) -> int:
     return 1
 
 
+def signal_state(snapshot: StatusSnapshot) -> dict[str, object]:
+    """What the monitor remembers about a status, to detect the next change."""
+    return {
+        "last_reset_id": snapshot.latest_reset.id if snapshot.latest_reset else None,
+        "watch_signature": watch_signature(snapshot.active_watch),
+        "scheduled_signature": schedule_signature(snapshot.scheduled_reset),
+        "stage": forecast(snapshot).stage,
+    }
+
+
+def pending_alerts(
+    snapshot: StatusSnapshot, state: dict[str, object]
+) -> list[tuple[str, str, str]]:
+    """The alerts this status raises against what the state last recorded."""
+    current_reset_id = snapshot.latest_reset.id if snapshot.latest_reset else None
+    current_watch_signature = watch_signature(snapshot.active_watch)
+    previous_schedule = state.get("scheduled_signature")
+    schedule_changed = schedule_signature(snapshot.scheduled_reset) != previous_schedule
+    watch_changed = (
+        "watch_signature" in state and current_watch_signature != state["watch_signature"]
+    )
+
+    alerts: list[tuple[str, str, str]] = []
+    if current_reset_id and current_reset_id != state.get("last_reset_id"):
+        alerts.append(format_reset_alert(snapshot.latest_reset, snapshot.stats))
+
+    # A scheduled reset is the stronger signal: the tracker replaces a
+    # probabilistic watch with it when an announcement names a landing. The
+    # signature is read without an "in state" guard, so a monitor whose cached
+    # response already carried a schedule reports it once after it learns to.
+    if schedule_changed and snapshot.scheduled_reset is not None:
+        alerts.append(format_scheduled_alert(snapshot.scheduled_reset, snapshot.stats))
+
+    if watch_changed and snapshot.active_watch is not None:
+        alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
+
+    # A signal that went away is worth one message, and only when nothing else
+    # explains it: a reset that landed, or a schedule that replaced the watch,
+    # already speaks for itself.
+    pending_gone = (
+        watch_changed
+        and snapshot.active_watch is None
+        and state["watch_signature"] is not None
+    ) or (
+        schedule_changed
+        and snapshot.scheduled_reset is None
+        and previous_schedule is not None
+    )
+    if (
+        pending_gone
+        and not alerts
+        and snapshot.active_watch is None
+        and snapshot.scheduled_reset is None
+    ):
+        alerts.append(format_forecast_cleared())
+
+    # A forecast that grows within its band changes no signature, so the stage
+    # carries the escalation on its own — unless an alert above already says it.
+    prediction = forecast(snapshot)
+    escalated = STAGE_RANK.get(prediction.stage, 0) > STAGE_RANK.get(
+        state.get("stage"), 0
+    )
+    if escalated and not alerts:
+        if snapshot.active_watch is not None:
+            alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
+        elif snapshot.scheduled_reset is not None:
+            alerts.append(format_scheduled_alert(snapshot.scheduled_reset, snapshot.stats))
+    return alerts
+
+
+def deliver_alerts(alerts: list[tuple[str, str, str]]) -> None:
+    labels = ", ".join(alert[0] for alert in alerts)
+    body = "\n\n".join(alert[2] for alert in alerts)
+    critical = any(alert[1] in {"SPEND NOW", "USE SOME"} for alert in alerts)
+    notify(f"Codex reset monitor: {labels}", body[:4000], critical=critical)
+    print(f"notified: {labels}")
+
+
 def run(show_latest: bool = False) -> int:
     state = load_state()
     saved_etag = state.get("etag")
@@ -668,7 +906,16 @@ def run(show_latest: bool = False) -> int:
         return record_failure(state, error)
 
     if snapshot is None:
-        # The cached status is still the current one, so its age restarts too.
+        # The tracker's representation is unchanged, but this monitor's derived
+        # state can still lag it: a cache written before the monitor tracked a
+        # signal, or a stage that time alone has moved. Reconciling the cached
+        # snapshot keeps those transitions from waiting on the next fetch.
+        cached = cached_snapshot(state)
+        if cached is not None:
+            alerts = pending_alerts(cached, state)
+            if alerts:
+                deliver_alerts(alerts)
+            state.update(signal_state(cached))
         state["failures"] = 0
         state["last_checked_at"] = now_utc()
         state["fetched_at"] = now_utc()
@@ -680,54 +927,30 @@ def run(show_latest: bool = False) -> int:
         print(format_status_report(snapshot))
         return 0
 
-    current_reset_id = snapshot.latest_reset.id if snapshot.latest_reset else None
-    current_watch_signature = watch_signature(snapshot.active_watch)
-    prediction = forecast(snapshot)
     settled = {
         "api_initialized": True,
         "failures": 0,
         "last_checked_at": now_utc(),
         "fetched_at": now_utc(),
         "snapshot": snapshot.raw,
-        "last_reset_id": current_reset_id,
-        "watch_signature": current_watch_signature,
-        "stage": prediction.stage,
     }
     if not state.get("api_initialized"):
         state.pop("initialized", None)
         state.pop("seen", None)
         state.update(settled)
+        state.update(signal_state(snapshot))
         if response_etag:
             state["etag"] = response_etag
         save_state(state)
         print("seeded current Codex Resets status")
         return 0
 
-    alerts: list[tuple[str, str, str]] = []
-    if current_reset_id and current_reset_id != state.get("last_reset_id"):
-        alerts.append(format_reset_alert(snapshot.latest_reset, snapshot.stats))
-
-    if "watch_signature" in state and current_watch_signature != state["watch_signature"]:
-        if snapshot.active_watch is None:
-            alerts.append(format_watch_cleared())
-        else:
-            alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
-
-    # A forecast that grows within its band changes no signature, so the stage
-    # carries the escalation on its own — unless an alert above already says it.
-    previous_stage = state.get("stage")
-    escalated = STAGE_RANK.get(prediction.stage, 0) > STAGE_RANK.get(previous_stage, 0)
-    if escalated and not alerts and snapshot.active_watch is not None:
-        alerts.append(format_watch_alert(snapshot.active_watch, snapshot.stats))
-
+    alerts = pending_alerts(snapshot, state)
     if alerts:
-        labels = ", ".join(alert[0] for alert in alerts)
-        body = "\n\n".join(alert[2] for alert in alerts)
-        critical = any(alert[1] in {"SPEND NOW", "USE SOME"} for alert in alerts)
-        notify(f"Codex reset monitor: {labels}", body[:4000], critical=critical)
-        print(f"notified: {labels}")
+        deliver_alerts(alerts)
 
     state.update(settled)
+    state.update(signal_state(snapshot))
     if response_etag:
         state["etag"] = response_etag
     save_state(state)

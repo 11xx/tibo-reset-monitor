@@ -2,6 +2,7 @@ APP := tibo-codex-reset-monitor
 BIN := $(HOME)/.local/bin/$(APP)
 UNIT_DIR := $(HOME)/.config/systemd/user
 STATE_DIR := $(HOME)/.local/state/$(APP)
+CACHE_DIR := $(HOME)/.cache/$(APP)
 
 .PHONY: install uninstall test
 
@@ -20,6 +21,8 @@ uninstall:
 	rm -f "$(BIN)" "$(UNIT_DIR)/$(APP).service" "$(UNIT_DIR)/$(APP).timer"
 	rm -f "$(STATE_DIR)/state.json" "$(STATE_DIR)/state.tmp"
 	-rmdir "$(STATE_DIR)"
+	rm -f "$(CACHE_DIR)"/status-*.jsonl
+	-rmdir "$(CACHE_DIR)"
 	systemctl --user daemon-reload
 
 test:

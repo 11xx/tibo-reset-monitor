@@ -27,15 +27,11 @@ MAX_RESPONSE_BYTES = 512 * 1024
 # A reset stays worth spending on for a few hours after it is announced, so the
 # forecast reports certainty rather than a prediction during that window.
 LANDED_RESET_HOURS = 3
-# The tracker publishes a scheduled reset without a probability, so the monitor
-# supplies its own reading: an explicit announcement outranks cadence, and it
-# crosses into SPEND NOW as the landing time arrives.
-SCHEDULE_AHEAD_PERCENT = 65
-SCHEDULE_IMMINENT_PERCENT = 80
-SCHEDULE_IMMINENT_MINUTES = 60
-# A schedule whose landing time has passed is awaiting evidence, not a dead
-# letter: the tracker keeps it until it observes the reset.
-SCHEDULE_DUE_PERCENT = 85
+# An explicit announcement is the tracker's surest signal: it withholds a
+# probability because it awaits execution evidence, not because the reset is in
+# doubt. The certainty is therefore full, and the stage carries what is left —
+# whether the reset has landed.
+CERTAIN_PERCENT = 100
 # A forecast published without a percentage still has a level; these are the
 # percentages the two levels stand for.
 LEVEL_CHANCE = {"strong": 75, "elevated": 45}
@@ -46,9 +42,17 @@ SPEND_NOW_PERCENT = 75
 USE_SOME_PERCENT = 50
 # How long a cached status stays worth showing without a hedge.
 CACHE_FRESH_SECONDS = 15 * 60
-# A reset that landed and a forecast worth spending now are both the top of the
-# ladder: neither escalates into the other, and the reset alert already speaks.
-STAGE_RANK = {"wait": 0, "use-some": 1, "spend-now": 2, "landed": 2}
+# Rank is how loudly a reading wants to be said, not how good the news is: a
+# certain reset that has not landed ranks below the moment its landing time
+# passes, and below the reset actually landing, so each step is announced once.
+STAGE_RANK = {
+    "wait": 0,
+    "use-some": 1,
+    "spend-now": 2,
+    "scheduled": 2,
+    "scheduled-due": 3,
+    "landed": 3,
+}
 
 BASIS_LABEL = {
     "reset": "a reset was just announced",
@@ -318,7 +322,13 @@ def format_countdown(value: str | None, now: datetime | None = None) -> str:
     now = now or utcnow()
     minutes = int(abs((parsed - now).total_seconds()) // 60)
     hours, minutes = divmod(minutes, 60)
-    span = f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        span = f"{days}d {hours}h"
+    elif hours:
+        span = f"{hours}h {minutes:02d}m"
+    else:
+        span = f"{minutes}m"
     return f"in {span}" if parsed >= now else f"overdue by {span}"
 
 
@@ -441,41 +451,41 @@ def stage_for(probability: int) -> tuple[str, str]:
 def schedule_reading(schedule: ScheduledReset, now: datetime) -> Forecast:
     """The monitor's own reading of a scheduled reset awaiting evidence.
 
-    The API attaches no probability to a schedule, so the number is the
-    monitor's: an explicit announcement outranks cadence, and it crosses into
-    SPEND NOW as the landing time arrives. A schedule whose landing time has
-    passed stays actionable, because the tracker keeps it until it observes
-    the reset rather than treating the deadline as completion.
+    An explicit announcement with a landing time is certain, so the percentage
+    is full and the stage carries what remains: `scheduled` while the landing is
+    ahead, `scheduled-due` once its time has passed without evidence. The action
+    follows that state rather than the percentage, and a banked reset is applied
+    from the account rather than refilling the quota on its own.
     """
     due = parse_timestamp(schedule.scheduled_for)
-    if due is not None and due <= now:
-        probability = SCHEDULE_DUE_PERCENT
+    overdue = due is not None and due <= now
+    if overdue:
         basis = "scheduled-due"
     else:
-        imminent = due is not None and due - now <= timedelta(
-            minutes=SCHEDULE_IMMINENT_MINUTES
-        )
-        probability = SCHEDULE_IMMINENT_PERCENT if imminent else SCHEDULE_AHEAD_PERCENT
         basis = "scheduled"
-    stage, action = stage_for(probability)
-    return Forecast(probability, basis, stage, action)
+    if schedule.reset_type == "banked":
+        action = "CHECK STATUS"
+    else:
+        action = "SPEND NOW" if overdue else "USE SOME"
+    return Forecast(CERTAIN_PERCENT, basis, basis, action)
 
 
 def forecast(snapshot: StatusSnapshot, now: datetime | None = None) -> Forecast:
-    """One percentage for how likely usable quota is in hand or on the way.
+    """The certainty that a reset is in hand or on the way, and what to do.
 
     A reset announced within the last few hours is not a prediction, so it reads
     as certainty. A scheduled reset the tracker is still awaiting evidence for
     comes next, because an explicit announcement outranks a probabilistic watch
-    and cadence alike. Otherwise a live published forecast wins, and cadence
-    carries the reading when no forecast applies. A forecast is not live once
-    it has expired, nor once a reset announced after it has superseded it.
+    and cadence alike; it is also certain, and only its landing is pending.
+    Otherwise a live published forecast wins, and cadence carries the reading
+    when no forecast applies. A forecast is not live once it has expired, nor
+    once a reset announced after it has superseded it.
     """
     now = now or utcnow()
     reset = snapshot.latest_reset
     announced = parse_timestamp(reset.announced_at) if reset else None
     if announced is not None and now - announced <= timedelta(hours=LANDED_RESET_HOURS):
-        return Forecast(100, "reset", "landed", "USE SOME")
+        return Forecast(CERTAIN_PERCENT, "reset", "landed", "USE SOME")
 
     schedule = snapshot.scheduled_reset
     schedule_announced = parse_timestamp(schedule.announced_at) if schedule else None
@@ -781,6 +791,34 @@ def state_path() -> Path:
     return root / APP / "state.json"
 
 
+def history_dir() -> Path:
+    if directory := os.environ.get("CACHE_DIRECTORY"):
+        return Path(directory)
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return root / APP
+
+
+def record_history(changed: bool, snapshot: StatusSnapshot | None = None) -> None:
+    """Append one observation to the cache, raw status included.
+
+    Every check lands here, unchanged or not, so a later analysis can tell a
+    signal that did not move from a monitor that did not run. The cache is
+    append-only, one JSON object per line per UTC day, and a write failure is
+    reported without stopping the run it recorded.
+    """
+    when = utcnow()
+    entry: dict[str, object] = {"checked_at": when.isoformat(), "changed": changed}
+    if snapshot is not None:
+        entry["data"] = snapshot.raw
+    try:
+        directory = history_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / f"status-{when:%Y-%m-%d}.jsonl").open("a") as handle:
+            handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except OSError as error:
+        print(f"history write failed: {error}", file=sys.stderr)
+
+
 def load_state() -> dict[str, object]:
     try:
         state = json.loads(state_path().read_text())
@@ -920,12 +958,15 @@ def run(show_latest: bool = False) -> int:
         state["last_checked_at"] = now_utc()
         state["fetched_at"] = now_utc()
         save_state(state)
+        record_history(changed=False)
         print("status unchanged (304)")
         return 0
 
     if show_latest:
         print(format_status_report(snapshot))
         return 0
+
+    record_history(changed=True, snapshot=snapshot)
 
     settled = {
         "api_initialized": True,

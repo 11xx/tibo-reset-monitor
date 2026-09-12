@@ -2,9 +2,10 @@
 
 A small Linux user service that checks the read-only Codex Resets status API
 every five minutes, sends a desktop notification when a reset, a scheduled
-reset, or a forecast changes, and feeds a bar indicator that shows how likely a
-reset is right now. It uses only the Python standard library and `notify-send`;
-no X account, SocialData account, or MCP connection is required.
+reset, or a forecast changes, keeps a small local history of every check, and
+feeds a bar indicator that shows how certain a reset is right now. It uses only
+the Python standard library and `notify-send`; no X account, SocialData
+account, or MCP connection is required.
 
 The tracker is an unofficial public source. Its reset records can identify
 regular or banked resets and whether the evidence was an X post or an observed
@@ -26,24 +27,42 @@ past the next actionable threshold.
 
 ## Forecast
 
-Every status resolves to one percentage, so the same number drives the
-notification and the bar. A reset announced within the last three hours is not a
-prediction and reads as certainty, advising `USE SOME` — the same thing its own
-notification says. A scheduled reset comes next: it is an explicit announcement
-awaiting execution evidence, so it outranks a probabilistic watch and cadence
-alike. It reads 65 while the landing is ahead, 80 within the last hour, and 85
-once the landing time has passed without evidence. The tracker attaches no
-probability to a schedule, so that number is the monitor's reading rather than
-the tracker's, and it is labelled as a scheduled reset wherever it is shown.
-Otherwise a published forecast carries the
-number — its own percentage, or the percentage its level stands for — unless it
-has expired or the reset it predicted has already been announced. With no
-forecast in force, the reading falls back to how far into the published average
-interval the current gap has run, capped below the actionable threshold: cadence
-alone never asks you to spend.
+Every status resolves to a percentage and a stage. The percentage is how
+certain the reset is; the stage is what to do about it, which lets a reset that
+is certain but has not landed read 100 without claiming it is already usable.
 
-The percentage names a stage, and the stage names an action: `SPEND NOW` at 75
-and above, `USE SOME` at 50, and `WAIT` below that.
+A reset announced within the last three hours reads 100 and advises `USE SOME` —
+the same thing its own notification says — in the `landed` stage. A scheduled
+reset comes next, because it is an explicit announcement awaiting execution
+evidence and so outranks a probabilistic watch and cadence alike. It also reads
+100: the tracker withholds a probability because it awaits evidence, not
+because the reset is in doubt. Its stage carries the difference — `scheduled`
+while the landing is ahead and `scheduled-due` once its time has passed without
+evidence — so a certain-but-unlanded reset can be styled apart from a landed
+one. The action follows that state: `USE SOME` while the landing is ahead,
+`SPEND NOW` once it is due, and `CHECK STATUS` for a banked reset, which the
+account applies rather than the quota refilling.
+
+Otherwise a published forecast carries the number — its own percentage, or the
+percentage its level stands for — unless it has expired or the reset it
+predicted has already been announced. With no forecast in force, the reading
+falls back to how far into the published average interval the current gap has
+run, capped below the actionable threshold: cadence alone never asks you to
+spend. There the percentage names the stage: `SPEND NOW` at 75 and above,
+`USE SOME` at 50, and `WAIT` below that.
+
+## History
+
+Every check appends one JSON object to
+`$XDG_CACHE_HOME/tibo-codex-reset-monitor/status-YYYY-MM-DD.jsonl`, one file per
+UTC day. An unchanged check records `{"checked_at": …, "changed": false}`, and
+a changed one adds the whole `data` object the tracker returned. Nothing is
+ever rewritten or pruned, so the timeline answers questions the monitor does
+not ask yet — how long a schedule preceded its landing, how often the tracker
+revised a forecast, and whether a gap was a quiet tracker or a monitor that had
+stopped running. A failed write is reported and never stops the run it records.
+The directory is systemd's `CacheDirectory` for the service, and `make
+uninstall` removes it along with everything else.
 
 ## Bar indicator
 
@@ -53,10 +72,13 @@ only once per timer run. A cache the monitor has not refreshed for fifteen
 minutes reports itself stale rather than passing for current.
 
 `eww/codex-reset.yuck` and `eww/codex-reset.scss` are an [eww](https://elkowar.github.io/eww)
-widget over that line. It is hidden below `USE SOME`, so its appearing is itself
-the signal, and it names no colour: style the `codex-reset--use-some`,
-`codex-reset--spend-now`, and `codex-reset--landed` classes from your own
-palette. Include it and place the widget in a bar:
+widget over that line. It is hidden in the `wait` stage, so its appearing is
+itself the signal, and it names no colour: style the `codex-reset--use-some`,
+`codex-reset--spend-now`, `codex-reset--scheduled`, `codex-reset--scheduled-due`,
+and `codex-reset--landed` classes from your own palette. A scheduled reset
+reaches 100 before it lands, so `codex-reset--scheduled` is where "certain, not
+yet usable" belongs, and `codex-reset--landed` is the one to make green.
+Include it and place the widget in a bar:
 
 ```lisp
 (include ".../eww/codex-reset.yuck")
@@ -87,7 +109,14 @@ systemctl --user status tibo-codex-reset-monitor.timer
 journalctl --user -u tibo-codex-reset-monitor.service -n 50 --no-pager
 ```
 
-Remove every installed file, including monitor state, with:
+Inspect the recorded history with:
+
+```sh
+ls ~/.cache/tibo-codex-reset-monitor/
+tail -n 1 ~/.cache/tibo-codex-reset-monitor/status-*.jsonl
+```
+
+Remove every installed file, including monitor state and history, with:
 
 ```sh
 make uninstall

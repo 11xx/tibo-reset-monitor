@@ -15,9 +15,13 @@
   :initial '{"state":"unavailable","visible":false,"probability":0,"basis":"unknown","stage":"wait","action":"WAIT","tooltip":""}'
   "tibo-codex-reset-monitor --bar")
 
-;; Hidden below the actionable threshold. A percentage that sits on the bar all
-;; day is wallpaper, and the point of this one is that its appearance is itself
-;; the signal; the tooltip then carries the forecast, its wording, and its age.
+;; Hidden in the `wait` stage. A percentage that sits on the bar all day is
+;; wallpaper, and the point of this one is that its appearance is itself the
+;; signal; the tooltip then carries the forecast, its wording, and its age.
+;;
+;; The stage also names the class, so a reset that is certain but has not landed
+;; (`scheduled`, `scheduled-due`) can be coloured apart from one that has
+;; (`landed`), even though all three read 100.
 ;;
 ;; A stale cache still shows its number, marked with a tilde: an old forecast is
 ;; worth more than a blank, as long as it cannot pass for a current one.

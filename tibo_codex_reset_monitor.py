@@ -818,18 +818,18 @@ def record_failure(state: dict[str, object], error: Exception) -> int:
     return 1
 
 
-def signal_state(snapshot: StatusSnapshot) -> dict[str, object]:
+def signal_state(snapshot: StatusSnapshot, prediction: Forecast) -> dict[str, object]:
     """What the monitor remembers about a status, to detect the next change."""
     return {
         "last_reset_id": snapshot.latest_reset.id if snapshot.latest_reset else None,
         "watch_signature": watch_signature(snapshot.active_watch),
         "scheduled_signature": schedule_signature(snapshot.scheduled_reset),
-        "stage": forecast(snapshot).stage,
+        "stage": prediction.stage,
     }
 
 
 def pending_alerts(
-    snapshot: StatusSnapshot, state: dict[str, object]
+    snapshot: StatusSnapshot, state: dict[str, object], prediction: Forecast
 ) -> list[tuple[str, str, str]]:
     """The alerts this status raises against what the state last recorded."""
     current_reset_id = snapshot.latest_reset.id if snapshot.latest_reset else None
@@ -876,7 +876,6 @@ def pending_alerts(
 
     # A forecast that grows within its band changes no signature, so the stage
     # carries the escalation on its own — unless an alert above already says it.
-    prediction = forecast(snapshot)
     escalated = STAGE_RANK.get(prediction.stage, 0) > STAGE_RANK.get(
         state.get("stage"), 0
     )
@@ -912,10 +911,11 @@ def run(show_latest: bool = False) -> int:
         # snapshot keeps those transitions from waiting on the next fetch.
         cached = cached_snapshot(state)
         if cached is not None:
-            alerts = pending_alerts(cached, state)
+            prediction = forecast(cached)
+            alerts = pending_alerts(cached, state, prediction)
             if alerts:
                 deliver_alerts(alerts)
-            state.update(signal_state(cached))
+            state.update(signal_state(cached, prediction))
         state["failures"] = 0
         state["last_checked_at"] = now_utc()
         state["fetched_at"] = now_utc()
@@ -934,23 +934,24 @@ def run(show_latest: bool = False) -> int:
         "fetched_at": now_utc(),
         "snapshot": snapshot.raw,
     }
+    prediction = forecast(snapshot)
     if not state.get("api_initialized"):
         state.pop("initialized", None)
         state.pop("seen", None)
         state.update(settled)
-        state.update(signal_state(snapshot))
+        state.update(signal_state(snapshot, prediction))
         if response_etag:
             state["etag"] = response_etag
         save_state(state)
         print("seeded current Codex Resets status")
         return 0
 
-    alerts = pending_alerts(snapshot, state)
+    alerts = pending_alerts(snapshot, state, prediction)
     if alerts:
         deliver_alerts(alerts)
 
     state.update(settled)
-    state.update(signal_state(snapshot))
+    state.update(signal_state(snapshot, prediction))
     if response_etag:
         state["etag"] = response_etag
     save_state(state)

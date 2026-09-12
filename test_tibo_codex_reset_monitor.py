@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 
 from tibo_codex_reset_monitor import (
     STATUS_URL,
+    ScheduledReset,
     bar_payload,
     ResetSignal,
     Source,
@@ -17,10 +18,12 @@ from tibo_codex_reset_monitor import (
     fetch_status,
     forecast,
     format_local_time,
+    format_scheduled_alert,
     format_watch_alert,
     parse_status,
     reset_action,
     run,
+    schedule_signature,
     watch_signature,
 )
 
@@ -45,11 +48,12 @@ def reset_payload(
     }
 
 
-def status_payload(*, reset=None, watch=None):
+def status_payload(*, reset=None, watch=None, scheduled=None):
     return json.dumps(
         {
             "data": {
                 "latest_reset": reset,
+                "scheduled_reset": scheduled,
                 "active_watch": watch,
                 "stats": {
                     "total": 46,
@@ -61,6 +65,30 @@ def status_payload(*, reset=None, watch=None):
             "meta": {"api_version": "v1", "generated_at": "2026-08-26T12:00:00Z"},
         }
     ).encode()
+
+
+def scheduled_payload(
+    *,
+    scheduled_id="scheduled-1",
+    reset_type="regular",
+    announced_at="2026-08-30T19:00:00Z",
+    scheduled_for="2026-08-30T23:00:00Z",
+    text="A reset is landing by midnight today.",
+    status="scheduled",
+):
+    return {
+        "id": scheduled_id,
+        "status": status,
+        "reset_type": reset_type,
+        "announced_at": announced_at,
+        "scheduled_for": scheduled_for,
+        "text": text,
+        "source": {
+            "type": "x_post",
+            "author": "thsottiaux",
+            "url": "https://x.com/thsottiaux/status/2",
+        },
+    }
 
 
 NOW = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
@@ -221,8 +249,9 @@ class MonitorTests(unittest.TestCase):
                 "I have reset Codex usage limits.",
                 Source("x_post", "https://x.com/1"),
             ),
-            None,
-            {"total": 46},
+            scheduled_reset=None,
+            active_watch=None,
+            stats={"total": 46},
         )
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "state.json"
@@ -247,8 +276,9 @@ class MonitorTests(unittest.TestCase):
                 "I have reset usage limits for all paid users of ChatGPT Work and Codex.",
                 Source("x_post", "https://x.com/2"),
             ),
-            None,
-            {"total": 47, "days_since_last": 0, "avg_interval_days": 7.6},
+            scheduled_reset=None,
+            active_watch=None,
+            stats={"total": 47, "days_since_last": 0, "avg_interval_days": 7.6},
         )
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "state.json"
@@ -297,8 +327,9 @@ class MonitorTests(unittest.TestCase):
                 "Usage reset for Codex.",
                 Source("x_post"),
             ),
-            watch,
-            {"days_since_last": 5, "avg_interval_days": 7.4},
+            scheduled_reset=None,
+            active_watch=watch,
+            stats={"days_since_last": 5, "avg_interval_days": 7.4},
         )
         prediction = forecast(snapshot, NOW)
         self.assertEqual((prediction.probability, prediction.basis), (88, "watch"))
@@ -313,8 +344,9 @@ class MonitorTests(unittest.TestCase):
                 "Usage reset for Codex.",
                 Source("x_post"),
             ),
-            None,
-            {"days_since_last": 0, "avg_interval_days": 7.4},
+            scheduled_reset=None,
+            active_watch=None,
+            stats={"days_since_last": 0, "avg_interval_days": 7.4},
         )
         prediction = forecast(snapshot, NOW)
         self.assertEqual((prediction.probability, prediction.basis), (100, "reset"))
@@ -338,8 +370,9 @@ class MonitorTests(unittest.TestCase):
                 "Usage reset for Codex.",
                 Source("x_post"),
             ),
-            watch,
-            {"days_since_last": 0.4, "avg_interval_days": 7.4},
+            scheduled_reset=None,
+            active_watch=watch,
+            stats={"days_since_last": 0.4, "avg_interval_days": 7.4},
         )
         prediction = forecast(snapshot, NOW)
         self.assertEqual(prediction.basis, "cadence")
@@ -355,18 +388,18 @@ class MonitorTests(unittest.TestCase):
             "A reset is coming.",
             Source("x_post"),
         )
-        snapshot = StatusSnapshot(None, watch, {"days_since_last": 7.4, "avg_interval_days": 7.4})
+        snapshot = StatusSnapshot(None, None, watch, {"days_since_last": 7.4, "avg_interval_days": 7.4})
         prediction = forecast(snapshot, NOW)
         self.assertEqual(prediction.basis, "cadence")
 
     def test_cadence_alone_never_reaches_the_actionable_threshold(self):
-        snapshot = StatusSnapshot(None, None, {"days_since_last": 40, "avg_interval_days": 7.4})
+        snapshot = StatusSnapshot(None, None, None, {"days_since_last": 40, "avg_interval_days": 7.4})
         prediction = forecast(snapshot, NOW)
         self.assertEqual(prediction.probability, 45)
         self.assertEqual((prediction.stage, prediction.action), ("wait", "WAIT"))
 
     def test_bar_payload_hides_a_quiet_forecast_and_shows_an_actionable_one(self):
-        quiet = StatusSnapshot(None, None, {"days_since_last": 1, "avg_interval_days": 7.4})
+        quiet = StatusSnapshot(None, None, None, {"days_since_last": 1, "avg_interval_days": 7.4})
         payload = bar_payload({"snapshot": quiet.raw, "fetched_at": "2026-08-30T19:58:00Z"}, NOW)
         self.assertFalse(payload["visible"])
 
@@ -434,6 +467,7 @@ class MonitorTests(unittest.TestCase):
             )
             with (
                 patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
                 patch(
                     "tibo_codex_reset_monitor.fetch_status",
                     return_value=(snapshot_at(74), '"etag"'),
@@ -448,6 +482,7 @@ class MonitorTests(unittest.TestCase):
 
             with (
                 patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
                 patch(
                     "tibo_codex_reset_monitor.fetch_status",
                     return_value=(snapshot_at(76), '"etag"'),
@@ -458,6 +493,304 @@ class MonitorTests(unittest.TestCase):
                 summary, _body = notify.call_args.args[:2]
                 self.assertIn("chance 76%", notify.call_args.args[1])
             self.assertEqual(json.loads(state_file.read_text())["stage"], "spend-now")
+
+    def test_parse_status_reads_a_scheduled_reset(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        schedule = snapshot.scheduled_reset
+        self.assertEqual(schedule.id, "scheduled-1")
+        self.assertEqual(schedule.status, "scheduled")
+        self.assertEqual(schedule.reset_type, "regular")
+        self.assertEqual(schedule.scheduled_for, "2026-08-30T23:00:00Z")
+        self.assertEqual(schedule.source.author, "thsottiaux")
+        self.assertIsNone(parse_status(status_payload()).scheduled_reset)
+
+    def test_rejects_a_malformed_scheduled_reset(self):
+        with self.assertRaisesRegex(ValueError, "data.scheduled_reset.status"):
+            parse_status(
+                status_payload(
+                    scheduled={
+                        "id": "1",
+                        "status": "",
+                        "reset_type": "regular",
+                        "announced_at": "2026-08-30T19:00:00Z",
+                        "scheduled_for": None,
+                        "text": "",
+                        "source": {"type": "observed", "url": None},
+                    }
+                )
+            )
+
+    def test_schedule_reading_tracks_the_landing_time(self):
+        def snapshot_at(scheduled_for):
+            return parse_status(
+                status_payload(
+                    reset=reset_payload(),
+                    scheduled=scheduled_payload(scheduled_for=scheduled_for),
+                )
+            )
+
+        ahead = forecast(snapshot_at("2026-08-30T23:00:00Z"), NOW)
+        self.assertEqual((ahead.probability, ahead.basis), (65, "scheduled"))
+        self.assertEqual((ahead.stage, ahead.action), ("use-some", "USE SOME"))
+
+        imminent = forecast(snapshot_at("2026-08-30T20:30:00Z"), NOW)
+        self.assertEqual((imminent.probability, imminent.basis), (80, "scheduled"))
+        self.assertEqual((imminent.stage, imminent.action), ("spend-now", "SPEND NOW"))
+
+        due = forecast(snapshot_at("2026-08-30T19:00:00Z"), NOW)
+        self.assertEqual((due.probability, due.basis), (85, "scheduled-due"))
+        self.assertEqual((due.stage, due.action), ("spend-now", "SPEND NOW"))
+
+    def test_schedule_without_a_landing_time_still_outranks_cadence(self):
+        snapshot = parse_status(
+            status_payload(
+                reset=reset_payload(),
+                scheduled=scheduled_payload(scheduled_for=None),
+            )
+        )
+        prediction = forecast(snapshot, NOW)
+        self.assertEqual((prediction.probability, prediction.basis), (65, "scheduled"))
+
+    def test_schedule_outranks_a_live_watch(self):
+        snapshot = parse_status(
+            status_payload(
+                reset=reset_payload(),
+                watch={
+                    "level": "strong",
+                    "reset_chance_percent": 88,
+                    "forecast_window": "within 24 hours",
+                    "observed_at": "2026-08-30T18:00:00Z",
+                    "expires_at": "2026-08-31T18:00:00Z",
+                    "text": "A reset may land later today.",
+                    "source": {"type": "observed", "author": None, "url": None},
+                },
+                scheduled=scheduled_payload(),
+            )
+        )
+        prediction = forecast(snapshot, NOW)
+        self.assertEqual(prediction.basis, "scheduled")
+
+    def test_landed_reset_supersedes_a_schedule_it_follows(self):
+        snapshot = parse_status(
+            status_payload(
+                reset={
+                    "id": "reset-2",
+                    "reset_type": "regular",
+                    "announced_at": "2026-08-30T19:30:00Z",
+                    "text": "Usage reset for Codex.",
+                    "source": {
+                        "type": "x_post",
+                        "author": "thsottiaux",
+                        "url": "https://x.com/2",
+                    },
+                },
+                scheduled=scheduled_payload(announced_at="2026-08-30T19:00:00Z"),
+            )
+        )
+        prediction = forecast(snapshot, NOW)
+        self.assertEqual((prediction.probability, prediction.basis), (100, "reset"))
+
+    def test_run_notifies_a_new_schedule_and_then_stays_quiet(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "api_initialized": True,
+                        "last_reset_id": "reset-1",
+                        "watch_signature": None,
+                        "stage": "wait",
+                    }
+                )
+            )
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(snapshot, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                summary, body = notify.call_args.args[:2]
+                self.assertIn("RESET SCHEDULED", summary)
+                self.assertIn("Action: USE SOME", body)
+                self.assertIn("Countdown: in 3h 00m", body)
+                self.assertEqual(json.loads(state_file.read_text())["stage"], "use-some")
+
+                notify.reset_mock()
+                self.assertEqual(run(), 0)
+                notify.assert_not_called()
+
+    def test_run_reports_a_schedule_once_its_time_arrives(self):
+        snapshot = parse_status(
+            status_payload(
+                reset=reset_payload(),
+                scheduled=scheduled_payload(scheduled_for="2026-08-30T19:30:00Z"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "api_initialized": True,
+                        "last_reset_id": "reset-1",
+                        "watch_signature": None,
+                        "scheduled_signature": schedule_signature(snapshot.scheduled_reset),
+                        "stage": "use-some",
+                    }
+                )
+            )
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(snapshot, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                summary, body = notify.call_args.args[:2]
+                self.assertIn("RESET DUE", summary)
+                self.assertIn("Action: SPEND NOW", body)
+                self.assertIn("overdue by 30m", body)
+
+    def test_run_keeps_a_cleared_watch_quiet_when_a_schedule_replaced_it(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "api_initialized": True,
+                        "last_reset_id": "reset-1",
+                        "watch_signature": "old-watch",
+                        "scheduled_signature": schedule_signature(snapshot.scheduled_reset),
+                        "stage": "use-some",
+                    }
+                )
+            )
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(snapshot, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                notify.assert_not_called()
+
+    def test_run_reports_a_forecast_that_cleared(self):
+        snapshot = parse_status(status_payload(reset=reset_payload()))
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "api_initialized": True,
+                        "last_reset_id": "reset-1",
+                        "watch_signature": "old-watch",
+                        "scheduled_signature": "old-schedule",
+                        "stage": "use-some",
+                    }
+                )
+            )
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(snapshot, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                summary, body = notify.call_args.args[:2]
+                self.assertIn("RESET FORECAST CLEARED", summary)
+                self.assertIn("Action: WAIT", body)
+
+    def test_run_reconciles_a_cached_schedule_on_a_not_modified(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        cached_state = {
+            "api_initialized": True,
+            "last_reset_id": "reset-1",
+            "watch_signature": None,
+            "stage": "wait",
+            "snapshot": snapshot.raw,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(json.dumps(cached_state))
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch(
+                    "tibo_codex_reset_monitor.fetch_status",
+                    return_value=(None, '"etag"'),
+                ),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                summary, _body = notify.call_args.args[:2]
+                self.assertIn("RESET SCHEDULED", summary)
+            state = json.loads(state_file.read_text())
+            self.assertEqual(
+                state["scheduled_signature"],
+                schedule_signature(snapshot.scheduled_reset),
+            )
+            self.assertEqual(state["stage"], "use-some")
+
+            # Time alone moves the reading once the landing time passes, so the
+            # due alert cannot wait for the tracker to invalidate its ETag.
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch(
+                    "tibo_codex_reset_monitor.utcnow",
+                    return_value=datetime(2026, 8, 30, 23, 30, tzinfo=timezone.utc),
+                ),
+                patch(
+                    "tibo_codex_reset_monitor.fetch_status",
+                    return_value=(None, '"etag"'),
+                ),
+                patch("tibo_codex_reset_monitor.notify") as notify,
+            ):
+                self.assertEqual(run(), 0)
+                self.assertIn("RESET DUE", notify.call_args.args[0])
+
+    def test_bar_payload_shows_a_scheduled_reset(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        payload = bar_payload(
+            {"snapshot": snapshot.raw, "fetched_at": "2026-08-30T19:58:00Z"}, NOW
+        )
+        self.assertTrue(payload["visible"])
+        self.assertEqual(payload["basis"], "scheduled")
+        self.assertEqual(payload["stage"], "use-some")
+        self.assertIn("Scheduled reset: 2026-08-30 20:00 (São Paulo)", payload["tooltip"])
+        self.assertIn("in 3h 00m", payload["tooltip"])
+
+    def test_format_scheduled_alert_names_the_event_and_the_landing(self):
+        schedule = ScheduledReset(
+            "scheduled-1",
+            "scheduled",
+            "banked",
+            "2026-08-30T19:00:00Z",
+            "2026-08-30T23:00:00Z",
+            "A banked reset is landing by midnight today.",
+            Source("x_post", "https://x.com/2", "thsottiaux"),
+        )
+        event, action, body = format_scheduled_alert(
+            schedule, {"total": 52, "days_since_last": 4.1, "avg_interval_days": 7}, NOW
+        )
+        self.assertEqual(event, "RESET SCHEDULED")
+        self.assertEqual(action, "USE SOME")
+        self.assertIn("Lands (São Paulo): 2026-08-30 20:00", body)
+        self.assertIn("Countdown: in 3h 00m", body)
+        self.assertIn("Quota: banked reset", body)
+        self.assertIn("Source post: https://x.com/2", body)
 
 
 if __name__ == "__main__":

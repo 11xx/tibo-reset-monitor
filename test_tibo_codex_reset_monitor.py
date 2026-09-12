@@ -17,10 +17,12 @@ from tibo_codex_reset_monitor import (
     classify_reset,
     fetch_status,
     forecast,
+    format_countdown,
     format_local_time,
     format_scheduled_alert,
     format_watch_alert,
     parse_status,
+    record_history,
     reset_action,
     run,
     schedule_signature,
@@ -112,6 +114,16 @@ class FakeResponse:
 
 
 class MonitorTests(unittest.TestCase):
+    def setUp(self):
+        # The history cache is a real directory on the machine; keep every test
+        # that runs `run()` out of the user's own cache.
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.history = Path(scratch.name)
+        history = patch("tibo_codex_reset_monitor.history_dir", return_value=self.history)
+        history.start()
+        self.addCleanup(history.stop)
+
     def test_parse_status_and_prediction(self):
         watch = {
             "level": "strong",
@@ -522,7 +534,7 @@ class MonitorTests(unittest.TestCase):
                 )
             )
 
-    def test_schedule_reading_tracks_the_landing_time(self):
+    def test_scheduled_reset_is_certain_and_only_its_landing_is_pending(self):
         def snapshot_at(scheduled_for):
             return parse_status(
                 status_payload(
@@ -532,16 +544,22 @@ class MonitorTests(unittest.TestCase):
             )
 
         ahead = forecast(snapshot_at("2026-08-30T23:00:00Z"), NOW)
-        self.assertEqual((ahead.probability, ahead.basis), (65, "scheduled"))
-        self.assertEqual((ahead.stage, ahead.action), ("use-some", "USE SOME"))
+        self.assertEqual((ahead.probability, ahead.basis), (100, "scheduled"))
+        self.assertEqual((ahead.stage, ahead.action), ("scheduled", "USE SOME"))
+        self.assertNotEqual(ahead.stage, "landed")
 
-        imminent = forecast(snapshot_at("2026-08-30T20:30:00Z"), NOW)
-        self.assertEqual((imminent.probability, imminent.basis), (80, "scheduled"))
-        self.assertEqual((imminent.stage, imminent.action), ("spend-now", "SPEND NOW"))
+        within_the_hour = forecast(snapshot_at("2026-08-30T20:30:00Z"), NOW)
+        self.assertEqual(
+            (within_the_hour.probability, within_the_hour.stage), (100, "scheduled")
+        )
 
         due = forecast(snapshot_at("2026-08-30T19:00:00Z"), NOW)
-        self.assertEqual((due.probability, due.basis), (85, "scheduled-due"))
-        self.assertEqual((due.stage, due.action), ("spend-now", "SPEND NOW"))
+        self.assertEqual((due.probability, due.basis), (100, "scheduled-due"))
+        self.assertEqual((due.stage, due.action), ("scheduled-due", "SPEND NOW"))
+
+    def test_countdown_reads_days_once_a_span_passes_one(self):
+        self.assertEqual(format_countdown("2026-09-01T23:00:00Z", NOW), "in 2d 3h")
+        self.assertEqual(format_countdown("2026-08-30T19:30:00Z", NOW), "overdue by 30m")
 
     def test_schedule_without_a_landing_time_still_outranks_cadence(self):
         snapshot = parse_status(
@@ -551,7 +569,7 @@ class MonitorTests(unittest.TestCase):
             )
         )
         prediction = forecast(snapshot, NOW)
-        self.assertEqual((prediction.probability, prediction.basis), (65, "scheduled"))
+        self.assertEqual((prediction.probability, prediction.basis), (100, "scheduled"))
 
     def test_schedule_outranks_a_live_watch(self):
         snapshot = parse_status(
@@ -619,7 +637,7 @@ class MonitorTests(unittest.TestCase):
                 self.assertIn("RESET SCHEDULED", summary)
                 self.assertIn("Action: USE SOME", body)
                 self.assertIn("Countdown: in 3h 00m", body)
-                self.assertEqual(json.loads(state_file.read_text())["stage"], "use-some")
+                self.assertEqual(json.loads(state_file.read_text())["stage"], "scheduled")
 
                 notify.reset_mock()
                 self.assertEqual(run(), 0)
@@ -641,7 +659,7 @@ class MonitorTests(unittest.TestCase):
                         "last_reset_id": "reset-1",
                         "watch_signature": None,
                         "scheduled_signature": schedule_signature(snapshot.scheduled_reset),
-                        "stage": "use-some",
+                        "stage": "scheduled",
                     }
                 )
             )
@@ -657,7 +675,7 @@ class MonitorTests(unittest.TestCase):
                 self.assertIn("Action: SPEND NOW", body)
                 self.assertIn("overdue by 30m", body)
 
-    def test_run_keeps_a_cleared_watch_quiet_when_a_schedule_replaced_it(self):
+    def test_a_cleared_watch_replaced_by_a_schedule_is_never_read_as_cleared(self):
         snapshot = parse_status(
             status_payload(reset=reset_payload(), scheduled=scheduled_payload())
         )
@@ -681,7 +699,9 @@ class MonitorTests(unittest.TestCase):
                 patch("tibo_codex_reset_monitor.notify") as notify,
             ):
                 self.assertEqual(run(), 0)
-                notify.assert_not_called()
+                summary, _body = notify.call_args.args[:2]
+                self.assertIn("RESET SCHEDULED", summary)
+                self.assertNotIn("CLEARED", summary)
 
     def test_run_reports_a_forecast_that_cleared(self):
         snapshot = parse_status(status_payload(reset=reset_payload()))
@@ -740,7 +760,7 @@ class MonitorTests(unittest.TestCase):
                 state["scheduled_signature"],
                 schedule_signature(snapshot.scheduled_reset),
             )
-            self.assertEqual(state["stage"], "use-some")
+            self.assertEqual(state["stage"], "scheduled")
 
             # Time alone moves the reading once the landing time passes, so the
             # due alert cannot wait for the tracker to invalidate its ETag.
@@ -768,7 +788,9 @@ class MonitorTests(unittest.TestCase):
         )
         self.assertTrue(payload["visible"])
         self.assertEqual(payload["basis"], "scheduled")
-        self.assertEqual(payload["stage"], "use-some")
+        self.assertEqual(payload["probability"], 100)
+        self.assertEqual(payload["stage"], "scheduled")
+        self.assertNotEqual(payload["stage"], "landed")
         self.assertIn("Scheduled reset: 2026-08-30 20:00 (São Paulo)", payload["tooltip"])
         self.assertIn("in 3h 00m", payload["tooltip"])
 
@@ -786,11 +808,82 @@ class MonitorTests(unittest.TestCase):
             schedule, {"total": 52, "days_since_last": 4.1, "avg_interval_days": 7}, NOW
         )
         self.assertEqual(event, "RESET SCHEDULED")
-        self.assertEqual(action, "USE SOME")
+        self.assertEqual(action, "CHECK STATUS")
         self.assertIn("Lands (São Paulo): 2026-08-30 20:00", body)
         self.assertIn("Countdown: in 3h 00m", body)
         self.assertIn("Quota: banked reset", body)
         self.assertIn("Source post: https://x.com/2", body)
+    def test_history_appends_one_line_per_check(self):
+        snapshot = parse_status(status_payload(reset=reset_payload()))
+        record_history(True, snapshot)
+        record_history(False)
+
+        files = sorted(self.history.glob("status-*.jsonl"))
+        self.assertEqual(len(files), 1)
+        lines = [json.loads(line) for line in files[0].read_text().splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0]["changed"])
+        self.assertEqual(lines[0]["data"]["latest_reset"]["id"], "reset-1")
+        self.assertFalse(lines[1]["changed"])
+
+    def test_history_failure_does_not_raise(self):
+        blocker = self.history / "blocker"
+        blocker.write_text("")
+        with patch("tibo_codex_reset_monitor.history_dir", return_value=blocker / "sub"):
+            record_history(False)
+
+    def test_a_run_records_its_status_in_the_history_cache(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(snapshot, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify"),
+            ):
+                self.assertEqual(run(), 0)
+
+        lines = [
+            json.loads(line)
+            for path in self.history.glob("status-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0]["changed"])
+        self.assertEqual(lines[0]["data"]["scheduled_reset"]["id"], "scheduled-1")
+
+    def test_an_unchanged_check_is_recorded_too(self):
+        snapshot = parse_status(status_payload(reset=reset_payload()))
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "api_initialized": True,
+                        "last_reset_id": "reset-1",
+                        "watch_signature": None,
+                        "stage": "wait",
+                        "snapshot": snapshot.raw,
+                    }
+                )
+            )
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch("tibo_codex_reset_monitor.fetch_status", return_value=(None, '"etag"')),
+                patch("tibo_codex_reset_monitor.notify"),
+            ):
+                self.assertEqual(run(), 0)
+
+        lines = [
+            json.loads(line)
+            for path in self.history.glob("status-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        self.assertEqual(lines, [{"checked_at": NOW.isoformat(), "changed": False}])
 
 
 if __name__ == "__main__":

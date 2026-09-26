@@ -896,5 +896,29 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(lines, [{"checked_at": NOW.isoformat(), "changed": False}])
 
 
+    def test_a_failed_check_is_recorded_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch(
+                    "tibo_codex_reset_monitor.fetch_status",
+                    side_effect=OSError("network unreachable"),
+                ),
+                patch("tibo_codex_reset_monitor.notify"),
+            ):
+                self.assertEqual(run(), 1)
+
+        lines = [
+            json.loads(line)
+            for path in self.history.glob("status-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        self.assertEqual(
+            lines,
+            [{"checked_at": NOW.isoformat(), "failed": True, "error": "network unreachable"}],
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -802,17 +802,24 @@ def history_dir() -> Path:
 
 
 def record_history(changed: bool, snapshot: StatusSnapshot | None = None) -> None:
-    """Append one observation to the cache, raw status included.
-
-    Every check lands here, unchanged or not, so a later analysis can tell a
-    signal that did not move from a monitor that did not run. The cache is
-    append-only, one JSON object per line per UTC day, and a write failure is
-    reported without stopping the run it recorded.
-    """
-    when = utcnow()
-    entry: dict[str, object] = {"checked_at": when.isoformat(), "changed": changed}
+    """Append one successful check to the cache, raw status included."""
+    entry: dict[str, object] = {"changed": changed}
     if snapshot is not None:
         entry["data"] = snapshot.raw
+    append_history(entry)
+
+
+def append_history(fields: dict[str, object]) -> None:
+    """Append one check to the cache, stamped with the time it ran.
+
+    Every check lands here, unchanged, changed or failed, so a later analysis
+    can tell a signal that did not move from a monitor that could not reach the
+    tracker and from one that did not run. The cache is append-only, one JSON
+    object per line per UTC day, and a write failure is reported without
+    stopping the run it recorded.
+    """
+    when = utcnow()
+    entry: dict[str, object] = {"checked_at": when.isoformat(), **fields}
     try:
         directory = history_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -849,6 +856,7 @@ def record_failure(state: dict[str, object], error: Exception) -> int:
     state["failures"] = failures
     state["last_checked_at"] = now_utc()
     save_state(state)
+    append_history({"failed": True, "error": str(error)})
     print(f"status failed: {error}", file=sys.stderr)
     if failures == 12 or (failures > 12 and failures % 288 == 0):
         notify(

@@ -114,8 +114,8 @@ journalctl --user -u tibo-codex-reset-monitor.service -n 50 --no-pager
 Inspect the recorded history with:
 
 ```sh
-ls ~/.cache/tibo-codex-reset-monitor/
-tail -n 1 ~/.cache/tibo-codex-reset-monitor/status-*.jsonl
+ls "${XDG_CACHE_HOME:-$HOME/.cache}/tibo-codex-reset-monitor/"
+tail -n 1 "${XDG_CACHE_HOME:-$HOME/.cache}"/tibo-codex-reset-monitor/status-*.jsonl
 ```
 
 Remove every installed file, including monitor state and history, with:

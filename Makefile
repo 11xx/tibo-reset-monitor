@@ -1,8 +1,8 @@
 APP := tibo-codex-reset-monitor
 BIN := $(HOME)/.local/bin/$(APP)
 UNIT_DIR := $(HOME)/.config/systemd/user
-STATE_DIR := $(HOME)/.local/state/$(APP)
-CACHE_DIR := $(HOME)/.cache/$(APP)
+STATE_DIR := $(or $(XDG_STATE_HOME),$(HOME)/.local/state)/$(APP)
+CACHE_DIR := $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/$(APP)
 
 .PHONY: install uninstall test
 

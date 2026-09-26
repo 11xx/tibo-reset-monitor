@@ -62,6 +62,8 @@ BASIS_LABEL = {
     "cadence": "reset cadence only, no live forecast",
     "unknown": "no forecast and no cadence published",
 }
+# Bases that report a reset in hand or announced, not a likelihood of one.
+CERTAIN_BASES = {"reset", "scheduled", "scheduled-due"}
 
 SPACE_RE = re.compile(r"\s+")
 POLICY_RE = re.compile(
@@ -698,8 +700,9 @@ def bar_tooltip(
     age_seconds: float,
     now: datetime,
 ) -> str:
+    measure = "certain" if prediction.basis in CERTAIN_BASES else "chance"
     lines = [
-        f"Codex reset chance {prediction.probability}% — {BASIS_LABEL[prediction.basis]}",
+        f"Codex reset {measure} ({prediction.probability}%) — {BASIS_LABEL[prediction.basis]}",
         f"Action: {prediction.action}",
     ]
     schedule = snapshot.scheduled_reset

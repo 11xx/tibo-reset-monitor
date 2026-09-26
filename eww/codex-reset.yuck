@@ -1,4 +1,6 @@
-;; An indicator for how likely a Codex usage reset is right now.
+;; An indicator for how certain a Codex usage reset is right now: full when a
+;; reset has landed or is scheduled, a published or cadence-based likelihood
+;; otherwise.
 ;;
 ;; The reading comes from the monitor's own cache, so a bar polling every few
 ;; seconds asks the public tracker nothing: the user timer is the only thing

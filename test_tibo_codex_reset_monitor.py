@@ -432,7 +432,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(payload["state"], "fresh")
         self.assertEqual(payload["probability"], 60)
         self.assertEqual(payload["action"], "USE SOME")
-        self.assertIn("Codex reset chance 60%", payload["tooltip"])
+        self.assertIn("Codex reset chance (60%)", payload["tooltip"])
         self.assertIn("window within 24 hours", payload["tooltip"])
 
     def test_bar_payload_marks_a_cache_the_monitor_stopped_refreshing(self):
@@ -794,6 +794,16 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Scheduled reset: 2026-08-30 20:00 (São Paulo)", payload["tooltip"])
         self.assertIn("in 3h 00m", payload["tooltip"])
 
+    def test_bar_tooltip_states_a_scheduled_reset_as_certain(self):
+        snapshot = parse_status(
+            status_payload(reset=reset_payload(), scheduled=scheduled_payload())
+        )
+        payload = bar_payload(
+            {"snapshot": snapshot.raw, "fetched_at": "2026-08-30T19:58:00Z"}, NOW
+        )
+        self.assertNotIn("chance 100%", payload["tooltip"])
+        self.assertIn("Codex reset certain (100%)", payload["tooltip"])
+
     def test_format_scheduled_alert_names_the_event_and_the_landing(self):
         schedule = ScheduledReset(
             "scheduled-1",
@@ -885,6 +895,30 @@ class MonitorTests(unittest.TestCase):
         ]
         self.assertEqual(lines, [{"checked_at": NOW.isoformat(), "changed": False}])
 
+
+    def test_a_failed_check_is_recorded_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            with (
+                patch("tibo_codex_reset_monitor.state_path", return_value=state_file),
+                patch("tibo_codex_reset_monitor.utcnow", return_value=NOW),
+                patch(
+                    "tibo_codex_reset_monitor.fetch_status",
+                    side_effect=OSError("network unreachable"),
+                ),
+                patch("tibo_codex_reset_monitor.notify"),
+            ):
+                self.assertEqual(run(), 1)
+
+        lines = [
+            json.loads(line)
+            for path in self.history.glob("status-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        self.assertEqual(
+            lines,
+            [{"checked_at": NOW.isoformat(), "failed": True, "error": "network unreachable"}],
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,11 +55,13 @@ spend. There the percentage names the stage: `SPEND NOW` at 75 and above,
 
 Every check appends one JSON object to
 `$XDG_CACHE_HOME/tibo-codex-reset-monitor/status-YYYY-MM-DD.jsonl`, one file per
-UTC day. An unchanged check records `{"checked_at": …, "changed": false}`, and
-a changed one adds the whole `data` object the tracker returned. Nothing is
-ever rewritten or pruned, so the timeline answers questions the monitor does
-not ask yet — how long a schedule preceded its landing, how often the tracker
-revised a forecast, and whether a gap was a quiet tracker or a monitor that had
+UTC day. An unchanged check records `{"checked_at": …, "changed": false}`, a
+changed one adds the whole `data` object the tracker returned, and a check that
+could not read the tracker records
+`{"checked_at": …, "failed": true, "error": …}`. Nothing is ever rewritten or pruned, so the timeline answers questions the
+monitor does not ask yet — how long a schedule preceded its landing, how often
+the tracker revised a forecast, and whether a quiet stretch was a tracker that
+did not move, a tracker the monitor could not reach, or a monitor that had
 stopped running. A failed write is reported and never stops the run it records.
 The directory is systemd's `CacheDirectory` for the service, and `make
 uninstall` removes it along with everything else.
@@ -112,8 +114,8 @@ journalctl --user -u tibo-codex-reset-monitor.service -n 50 --no-pager
 Inspect the recorded history with:
 
 ```sh
-ls ~/.cache/tibo-codex-reset-monitor/
-tail -n 1 ~/.cache/tibo-codex-reset-monitor/status-*.jsonl
+ls "${XDG_CACHE_HOME:-$HOME/.cache}/tibo-codex-reset-monitor/"
+tail -n 1 "${XDG_CACHE_HOME:-$HOME/.cache}"/tibo-codex-reset-monitor/status-*.jsonl
 ```
 
 Remove every installed file, including monitor state and history, with:
